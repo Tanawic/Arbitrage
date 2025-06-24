@@ -184,7 +184,7 @@
                         <tr>
                             <th class="px-4 py-3">Expiry</th>
                             <th class="px-4 py-3">Strike Range</th>
-                            <th class="px-4 py-3">Net Premium (Mark Price USD)</th>
+                            <th class="px-4 py-3">Net Premium (Executable Price USD)</th>
                             <th class="px-4 py-3">Theoretical Value (USD)</th>
                             <th class="px-4 py-3">Transaction Fees (USD)</th>
                             <th class="px-4 py-3">Arbitrage Profit (Net USD)</th>
@@ -208,7 +208,7 @@
                             <th class="px-4 py-3">Strike</th>
                             <th class="px-4 py-3">Shorter Expiry</th>
                             <th class="px-4 py-3">Longer Expiry</th>
-                            <th class="px-4 py-3">Premium Diff (Mark Price USD)</th>
+                            <th class="px-4 py-3">Premium Diff (Executable Price USD)</th>
                             <th class="px-4 py-3">Transaction Fees (USD)</th>
                             <th class="px-4 py-3">Arbitrage Profit (Net USD)</th>
                         </tr>
@@ -280,7 +280,8 @@
         let ws = null; // WebSocket instance
         let audioCtx = null; // AudioContext for sound alerts
         let isMuted = false; // Mute state for audio alerts
-        let instrumentData = {}; // Stores real-time bid/ask for subscribed instruments (key: instrument_name, value: ticker data)
+        // Stores real-time bid/ask/mark for subscribed instruments (key: instrument_name, value: ticker data)
+        let instrumentData = {}; 
         let potentialBoxSpreads = []; // Stores all possible box spread combinations
         let potentialCalendarSpreads = []; // Stores all possible calendar spread combinations
         let calculatedBoxSpreadsData = []; // Stores calculated box spreads for sorting and LLM context
@@ -627,349 +628,420 @@
                 calculatedBoxSpreadsData = [];
                 potentialBoxSpreads.forEach(box => {
                     const legData = box.legs.map(leg => instrumentData[leg]);
-                    // Ensure all legs have mark_price for calculation
-                    if (legData.some(d => !d || d.mark_price === undefined)) {
+                    // Ensure all legs have bid_price and ask_price for calculation
+                    if (legData.some(d => !d || d.bid_price === undefined || d.ask_price === undefined)) {
                         return;
                     }
 
-                    // Convert premiums from BTC (mark_price) to USD
-                    const leg1PremiumUSD = legData[0].mark_price * btcUsdPrice; // Buy Call K1
-                    const leg2PremiumUSD = legData[1].mark_price * btcUsdPrice; // Sell Put K1
-                    const leg3PremiumUSD = legData[2].mark_price * btcUsdPrice; // Sell Call K2
-                    const leg4PremiumUSD = legData[3].mark_price * btcUsdPrice; // Buy Put K2
+                    // For Box Spread:
+                    // Leg 0: Buy Call K1 - BUY at ASK
+                    // Leg 1: Sell Put K1 - SELL at BID
+                    // Leg 2: Sell Call K2 - SELL at BID
+                    // Leg 3: Buy Put K2 - BUY at ASK
 
-                    // Box Spread: Buy Call K1, Sell Put K1, Sell Call K2, Buy Put K2
-                    // Gross Net Premium (USD) = (Premium C_K1 in USD) - (Premium P_K1 in USD) - (Premium C_K2 in USD) + (Premium P_K2 in USD)
-                    // Note: Using mark_price for all premiums for consistency as per user's request,
-                    // which differs from traditional bid/ask based arbitrage.
-                    const grossNetPremiumUSD = leg1PremiumUSD - leg2PremiumUSD - leg3PremiumUSD + leg4PremiumUSD;
-                    
-                    // Theoretical value (strike difference) is already in USD
-                    const theoreticalValueUSD = (box.k2 - box.k1); 
-                    
-                    // Fees are sum of (premium * fee_rate) for each leg, already in USD
-                    const totalTransactionFees = (leg1PremiumUSD * transactionFeeRate) +
-                                                 (leg2PremiumUSD * transactionFeeRate) +
-                                                 (leg3PremiumUSD * transactionFeeRate) +
-                                                 (leg4PremiumUSD * transactionFeeRate);
+                    const leg0CostUSD = legData[0].ask_price * btcUsdPrice; // Buy Call K1
+                    const leg1RevenueUSD = legData[1].bid_price * btcUsdPrice; // Sell Put K1
+                    const leg2RevenueUSD = legData[2].bid_price * btcUsdPrice; // Sell Call K2
+                    const leg3CostUSD = legData[3].ask_price * btcUsdPrice; // Buy Put K2
 
-                    const profit = theoreticalValueUSD - grossNetPremiumUSD - totalTransactionFees;
-                    
-                    box.profit = profit;
-                    box.grossNetPremium = grossNetPremiumUSD; // Store in USD
-                    box.theoreticalValue = theoreticalValueUSD; // Store in USD
-                    box.totalTransactionFees = totalTransactionFees;
-                    calculatedBoxSpreadsData.push(box);
+                    // Net Premium (cash flow at time 0) = (Cost of Buy Call K1 + Cost of Buy Put K2) - (Revenue from Sell Put K1 + Revenue from Sell Call K2)
+                    const netPremiumUSD = (leg0CostUSD + leg3CostUSD) - (leg1RevenueUSD + leg2RevenueUSD);
 
-                    const isProfitable = profit >= threshold;
-                    if (isProfitable) {
-                        alertedOpportunities.add(box.id); // Still profitable, keep in alerted set
-                        if (!previouslyAlerted.has(box.id)) { // Only alert if new or re-profitable
+                    // Theoretical Value (Profit at expiry) for a Box Spread is always K2 - K1
+                    const theoreticalValueUSD = box.k2 - box.k1;
+
+                    // Transaction Fees: Sum of absolute values of premiums of all legs (as they are all traded), multiplied by fee rate
+                    const totalPremiumsSum = leg0CostUSD + leg1RevenueUSD + leg2RevenueUSD + leg3CostUSD; // Sum of prices used for each leg
+                    const transactionFeesUSD = totalPremiumsSum * transactionFeeRate;
+
+                    // Arbitrage Profit: Theoretical Value - Net Premium (cost) - Transaction Fees
+                    const arbitrageProfitUSD = theoreticalValueUSD - netPremiumUSD - transactionFeesUSD;
+
+                    calculatedBoxSpreadsData.push({
+                        id: box.id,
+                        expiry: box.expiry,
+                        k1: box.k1,
+                        k2: box.k2,
+                        netPremium: netPremiumUSD,
+                        theoreticalValue: theoreticalValueUSD,
+                        transactionFees: transactionFeesUSD,
+                        arbitrageProfit: arbitrageProfitUSD,
+                        legs: box.legs
+                    });
+                });
+
+                // Sort by arbitrage profit in descending order
+                calculatedBoxSpreadsData.sort((a, b) => b.arbitrageProfit - a.arbitrageProfit);
+                renderBoxSpreadTable(calculatedBoxSpreadsData.slice(0, 5), threshold);
+
+                // Check and alert for new profitable opportunities
+                calculatedBoxSpreadsData.forEach(spread => {
+                    if (spread.arbitrageProfit > threshold) {
+                        const alertId = spread.id;
+                        if (!previouslyAlerted.has(alertId)) {
                             playAlertSound();
-                            showToast(`พบ Box Spread Arbitrage! กำไรสุทธิ: $${profit.toFixed(2)}`);
-                            addLog(`🚨 <span class="text-yellow-300">แจ้งเตือน [${box.expiry} ${box.k1}/${box.k2}]!</span> กำไรสุทธิ: <span class="font-bold text-green-400">$${profit.toFixed(2)}</span>`, 'warn');
+                            showToast(`🚨 Box Spread Arbitrage Opportunity: $${spread.arbitrageProfit.toFixed(2)} for ${spread.expiry} ${spread.k1}-${spread.k2}K!`);
+                            addLog(`🚨 พบโอกาส Arbitrage Box Spread ที่มีกำไร: $${spread.arbitrageProfit.toFixed(2)} สำหรับ ${spread.expiry} ${spread.k1}-${spread.k2}K`, 'warn');
                         }
-                    } else if (previouslyAlerted.has(box.id)) {
-                        // Was profitable but no longer, remove from alerted set implicitly by not re-adding
-                        // and optionally log if needed
-                        addLog(`Box Spread [${box.expiry} ${box.k1}/${box.k2}] กำไรต่ำกว่าเกณฑ์ (${profit.toFixed(2)} USD)`, 'info');
+                        alertedOpportunities.add(alertId); // Mark as alerted for this cycle
                     }
                 });
 
-                const top5 = calculatedBoxSpreadsData.sort((a, b) => b.profit - a.profit).slice(0, 5);
-                boxTableBody.innerHTML = '';
-                if (top5.length === 0) {
-                    boxLoadingRow.querySelector('td').textContent = instrumentScanComplete ? "กำลังรอข้อมูลราคา Real-time หรือไม่พบโอกาส Arbitrage." : "กำลังสแกนหา Options...";
-                    boxTableBody.appendChild(boxLoadingRow);
-                } else {
-                    top5.forEach(box => {
-                        const row = document.createElement('tr');
-                        row.className = `bg-gray-800 border-b border-gray-700 transition-colors duration-500 ${alertedOpportunities.has(box.id) ? 'highlight-alert' : ''}`;
-                        row.innerHTML = `
-                            <td class="px-4 py-3 font-medium text-white">${box.expiry}</td>
-                            <td class="px-4 py-3">${box.k1} / ${box.k2}</td>
-                            <td class="px-4 py-3 text-center">${box.grossNetPremium.toFixed(2)}</td>
-                            <td class="px-4 py-3 text-center">${box.theoreticalValue.toFixed(2)}</td>
-                            <td class="px-4 py-3 text-center">${box.totalTransactionFees.toFixed(2)}</td>
-                            <td class="px-4 py-3 text-center positive-arbitrage">${box.profit.toFixed(2)}</td>
-                        `;
-                        boxTableBody.appendChild(row);
-                    });
-                }
             } else if (currentArbitrageType === 'calendar') {
                 calculatedCalendarSpreadsData = [];
-                potentialCalendarSpreads.forEach(cal => {
-                    // legs: [Shorter Option, Longer Option]
-                    const shorterLegData = instrumentData[cal.legs[0]];
-                    const longerLegData = instrumentData[cal.legs[1]];
+                potentialCalendarSpreads.forEach(calendar => {
+                    const shorterLegData = instrumentData[calendar.legs[0]];
+                    const longerLegData = instrumentData[calendar.legs[1]];
 
-                    // Ensure both legs have mark_price for calculation
-                    if (!shorterLegData || !longerLegData || 
-                        shorterLegData.mark_price === undefined || longerLegData.mark_price === undefined) {
+                    // Ensure both legs have bid_price and ask_price for calculation
+                    if (!shorterLegData || shorterLegData.bid_price === undefined || shorterLegData.ask_price === undefined || 
+                        !longerLegData || longerLegData.bid_price === undefined || longerLegData.ask_price === undefined) {
                         return;
                     }
 
-                    // Calendar Spread: Sell Shorter, Buy Longer (same strike, different expiries)
-                    // premium_2 (shorter, sold) = shorterLegData.mark_price (in BTC)
-                    // premium_1 (longer, bought) = longerLegData.mark_price (in BTC)
-                    
-                    // Convert premiums from BTC (mark_price) to USD
-                    const premiumShorterSoldUSD = shorterLegData.mark_price * btcUsdPrice;
-                    const premiumLongerBoughtUSD = longerLegData.mark_price * btcUsdPrice;
+                    // For Calendar Spread: Sell Shorter Expiry, Buy Longer Expiry (same strike, same type)
+                    // Shorter Leg (Sell) - SELL at BID
+                    // Longer Leg (Buy) - BUY at ASK
 
-                    // Gross Profit / Premium Difference (USD) (before fees)
-                    const grossPremiumDifferenceUSD = premiumShorterSoldUSD - premiumLongerBoughtUSD;
-                    
-                    // Fees: Fee_shorter (on selling shorter) + Fee_longer (on buying longer), already in USD
-                    const totalTransactionFees = (premiumShorterSoldUSD * transactionFeeRate) +
-                                                 (premiumLongerBoughtUSD * transactionFeeRate);
+                    const shorterLegRevenueUSD = shorterLegData.bid_price * btcUsdPrice; // Sell Shorter
+                    const longerLegCostUSD = longerLegData.ask_price * btcUsdPrice; // Buy Longer
 
-                    // Net Profit = Gross Premium Difference - Total Transaction Fees
-                    const profit = grossPremiumDifferenceUSD - totalTransactionFees;
+                    // Premium Difference (Net Credit/Debit): Sell Shorter, Buy Longer
+                    const premiumDiffUSD = shorterLegRevenueUSD - longerLegCostUSD;
 
-                    cal.profit = profit;
-                    cal.grossPremiumDifference = grossPremiumDifferenceUSD; // Store in USD
-                    cal.totalTransactionFees = totalTransactionFees;
-                    calculatedCalendarSpreadsData.push(cal);
+                    // Transaction Fees: Sum of absolute values of premiums of both legs, multiplied by fee rate
+                    const totalPremiumsSum = shorterLegRevenueUSD + longerLegCostUSD; // Sum of prices used for each leg
+                    const transactionFeesUSD = totalPremiumsSum * transactionFeeRate;
 
-                    const isProfitable = profit >= threshold;
-                    if (isProfitable) {
-                        alertedOpportunities.add(cal.id); // Still profitable, keep in alerted set
-                        if (!previouslyAlerted.has(cal.id)) { // Only alert if new or re-profitable
-                            playAlertSound();
-                            showToast(`พบ Calendar Spread Arbitrage! กำไรสุทธิ: $${profit.toFixed(2)}`);
-                            addLog(`🚨 <span class="text-yellow-300">แจ้งเตือน [CAL ${cal.strike} ${cal.type} ${cal.shorterExpiry}/${cal.longerExpiry}]!</span> กำไรสุทธิ: <span class="font-bold text-green-400">$${profit.toFixed(2)}</span>`, 'warn');
-                        }
-                    } else if (previouslyAlerted.has(cal.id)) {
-                        // Was profitable but no longer, remove from alerted set implicitly by not re-adding
-                        // and optionally log if needed
-                        addLog(`Calendar Spread [${cal.strike} ${cal.type} ${cal.shorterExpiry}/${cal.longerExpiry}] กำไรต่ำกว่าเกณฑ์ (${profit.toFixed(2)} USD)`, 'info');
-                    }
+                    // Arbitrage Profit (Net Credit after fees)
+                    const arbitrageProfitUSD = premiumDiffUSD - transactionFeesUSD;
+
+                    calculatedCalendarSpreadsData.push({
+                        id: calendar.id,
+                        type: calendar.type,
+                        strike: calendar.strike,
+                        shorterExpiry: calendar.shorterExpiry,
+                        longerExpiry: calendar.longerExpiry,
+                        premiumDiff: premiumDiffUSD,
+                        transactionFees: transactionFeesUSD,
+                        arbitrageProfit: arbitrageProfitUSD, // This represents the net credit
+                        legs: calendar.legs
+                    });
                 });
 
-                const top5 = calculatedCalendarSpreadsData.sort((a, b) => b.profit - a.profit).slice(0, 5); 
-                calendarTableBody.innerHTML = '';
-                if (top5.length === 0) {
-                    calendarLoadingRow.querySelector('td').textContent = instrumentScanComplete ? "กำลังรอข้อมูลราคา Real-time หรือไม่พบโอกาส Arbitrage." : "กำลังสแกนหา Options...";
-                    calendarTableBody.appendChild(calendarLoadingRow);
-                } else {
-                    top5.forEach(cal => {
-                        const row = document.createElement('tr');
-                        row.className = `bg-gray-800 border-b border-gray-700 transition-colors duration-500 ${alertedOpportunities.has(cal.id) ? 'highlight-alert' : ''}`;
-                        row.innerHTML = `
-                            <td class="px-4 py-3 font-medium text-white">${cal.type}</td>
-                            <td class="px-4 py-3">${cal.strike}</td>
-                            <td class="px-4 py-3">${cal.shorterExpiry}</td>
-                            <td class="px-4 py-3">${cal.longerExpiry}</td>
-                            <td class="px-4 py-3 text-center">${cal.grossPremiumDifference.toFixed(2)}</td>
-                            <td class="px-4 py-3 text-center">${cal.totalTransactionFees.toFixed(2)}</td>
-                            <td class="px-4 py-3 text-center positive-arbitrage">${cal.profit.toFixed(2)}</td>
-                        `;
-                        calendarTableBody.appendChild(row);
-                    });
-                }
+                // Sort by arbitrage profit (net credit) in descending order
+                calculatedCalendarSpreadsData.sort((a, b) => b.arbitrageProfit - a.arbitrageProfit);
+                renderCalendarSpreadTable(calculatedCalendarSpreadsData.slice(0, 5), threshold);
+
+                // Check and alert for new profitable opportunities
+                calculatedCalendarSpreadsData.forEach(spread => {
+                    // For calendar spreads, a positive arbitrageProfit means a net credit.
+                    // We alert if this net credit exceeds the threshold.
+                    if (spread.arbitrageProfit > threshold) {
+                        const alertId = spread.id;
+                        if (!previouslyAlerted.has(alertId)) {
+                            playAlertSound();
+                            showToast(`🚨 Calendar Spread Arbitrage Opportunity: $${spread.arbitrageProfit.toFixed(2)} for ${spread.strike}K ${spread.type} (${spread.shorterExpiry} / ${spread.longerExpiry})!`);
+                            addLog(`🚨 พบโอกาส Arbitrage Calendar Spread ที่มีกำไร: $${spread.arbitrageProfit.toFixed(2)} สำหรับ ${spread.strike}K ${spread.type} (${spread.shorterExpiry} / ${spread.longerExpiry})`, 'warn');
+                        }
+                        alertedOpportunities.add(alertId); // Mark as alerted for this cycle
+                    }
+                });
             }
-            lastUpdatedEl.textContent = `อัปเดตล่าสุด: ${new Date().toLocaleTimeString('th-TH')}`;
+
+            // Clean up old alerts (opportunities that were profitable but are no longer)
+            previouslyAlerted.forEach(alertId => {
+                const foundInCurrent = (currentArbitrageType === 'box' ? calculatedBoxSpreadsData : calculatedCalendarSpreadsData).some(s => s.id === alertId && s.arbitrageProfit > threshold);
+                if (!foundInCurrent) {
+                    addLog(`โอกาส Arbitrage '${alertId}' ไม่เป็นที่น่าพอใจแล้ว`, 'info');
+                }
+            });
         }
-        
-        // --- WEBSOCKET CONNECTION ---
+
+
+        /**
+         * Renders the top 5 Box Spread opportunities in the table.
+         * @param {Array<Object>} spreads - Array of calculated box spread opportunities.
+         * @param {number} threshold - The profit threshold for highlighting.
+         */
+        function renderBoxSpreadTable(spreads, threshold) {
+            boxTableBody.innerHTML = ''; // Clear existing rows
+            if (spreads.length === 0) {
+                boxTableBody.innerHTML = `<tr><td colspan="6" class="text-center p-8 text-gray-400">ไม่พบโอกาส Box Spread ที่เป็นไปได้</td></tr>`;
+                return;
+            }
+
+            spreads.forEach(spread => {
+                const row = document.createElement('tr');
+                row.className = `border-b border-gray-700 hover:bg-gray-700/50 ${spread.arbitrageProfit > threshold ? 'highlight-alert' : ''}`;
+                row.innerHTML = `
+                    <td class="px-4 py-3">${spread.expiry}</td>
+                    <td class="px-4 py-3">${spread.k1} - ${spread.k2}</td>
+                    <td class="px-4 py-3">${spread.netPremium.toFixed(2)} USD</td>
+                    <td class="px-4 py-3">${spread.theoreticalValue.toFixed(2)} USD</td>
+                    <td class="px-4 py-3">${spread.transactionFees.toFixed(2)} USD</td>
+                    <td class="px-4 py-3 ${spread.arbitrageProfit > 0 ? 'positive-arbitrage' : 'text-red-400'}">${spread.arbitrageProfit.toFixed(2)} USD</td>
+                `;
+                boxTableBody.appendChild(row);
+            });
+        }
+
+        /**
+         * Renders the top 5 Calendar Spread opportunities in the table.
+         * @param {Array<Object>} spreads - Array of calculated calendar spread opportunities.
+         * @param {number} threshold - The profit threshold for highlighting.
+         */
+        function renderCalendarSpreadTable(spreads, threshold) {
+            calendarTableBody.innerHTML = ''; // Clear existing rows
+            if (spreads.length === 0) {
+                calendarTableBody.innerHTML = `<tr><td colspan="7" class="text-center p-8 text-gray-400">ไม่พบโอกาส Calendar Spread ที่เป็นไปได้</td></tr>`;
+                return;
+            }
+
+            spreads.forEach(spread => {
+                const row = document.createElement('tr');
+                row.className = `border-b border-gray-700 hover:bg-gray-700/50 ${spread.arbitrageProfit > threshold ? 'highlight-alert' : ''}`;
+                row.innerHTML = `
+                    <td class="px-4 py-3">${spread.type}</td>
+                    <td class="px-4 py-3">${spread.strike}</td>
+                    <td class="px-4 py-3">${spread.shorterExpiry}</td>
+                    <td class="px-4 py-3">${spread.longerExpiry}</td>
+                    <td class="px-4 py-3">${spread.premiumDiff.toFixed(2)} USD</td>
+                    <td class="px-4 py-3">${spread.transactionFees.toFixed(2)} USD</td>
+                    <td class="px-4 py-3 ${spread.arbitrageProfit > 0 ? 'positive-arbitrage' : 'text-red-400'}">${spread.arbitrageProfit.toFixed(2)} USD</td>
+                `;
+                calendarTableBody.appendChild(row);
+            });
+        }
+
+
+        // --- WEBSOCKET CONNECTION TO DERIBIT ---
         /**
          * Establishes a WebSocket connection to Deribit.
-         * Includes logic for connection status, message handling, and reconnection.
+         * Handles connection, disconnection, and message parsing.
          */
         function connectWebSocket() {
-            // If a WebSocket connection already exists, close it first
             if (ws) {
                 ws.close();
             }
-
-            connStatus.classList.replace('bg-green-500', 'bg-yellow-500');
-            connStatus.classList.replace('bg-red-500', 'bg-yellow-500');
-            connStatus.classList.add('animate-pulse'); // Pulsing yellow indicates connecting
-            connText.textContent = 'กำลังเชื่อมต่อกับ Deribit...';
-            connText.classList.replace('text-green-400', 'text-yellow-400');
-            connText.classList.replace('text-red-400', 'text-yellow-400');
-            addLog('กำลังพยายามเชื่อมต่อกับ Deribit...', 'info');
-
-            ws = new WebSocket('wss://www.deribit.com/ws/api/v2');
+            // Using Deribit testnet for demonstration. For production, use wss://www.deribit.com/ws/api/v2
+            ws = new WebSocket('wss://test.deribit.com/ws/api/v2'); 
 
             ws.onopen = () => {
-                connStatus.classList.remove('animate-pulse');
-                connStatus.classList.replace('bg-yellow-500', 'bg-green-500');
-                connText.textContent = 'เชื่อมต่อสำเร็จ';
-                connText.classList.replace('text-yellow-400', 'text-green-400');
-                addLog('เชื่อมต่อกับ Deribit สำเร็จ. กำลังดึงรายการ Options...', 'success');
+                connStatus.classList.remove('bg-yellow-500', 'bg-red-500');
+                connStatus.classList.add('bg-green-500');
+                connStatus.classList.remove('animate-pulse'); // Stop pulsing when connected
+                connText.textContent = 'เชื่อมต่อสำเร็จกับ Deribit';
+                connText.classList.remove('text-yellow-400', 'text-red-400');
+                connText.classList.add('text-green-400');
+                addLog('เชื่อมต่อ WebSocket กับ Deribit สำเร็จ', 'success');
 
-                // Request all BTC options after successful connection
+                // 1. Get current BTC-USD price (important for converting option premiums)
+                ws.send(JSON.stringify({
+                    "jsonrpc": "2.0",
+                    "method": "public/get_index_price",
+                    "id": 1,
+                    "params": {
+                        "index_name": "BTC_USD"
+                    }
+                }));
+
+                // 2. Get all instruments (BTC options)
                 ws.send(JSON.stringify({
                     "jsonrpc": "2.0",
                     "method": "public/get_instruments",
-                    "id": 101, // Request ID for get_instruments
-                    "params": { "currency": "BTC", "kind": "option", "expired": false }
-                }));
-                // Subscribe to BTC-PERPETUAL for index_price to convert BTC premiums to USD
-                ws.send(JSON.stringify({
-                    "jsonrpc": "2.0",
-                    "method": "public/subscribe",
-                    "id": 102,
-                    "params": { "channels": ["ticker.BTC-PERPETUAL.100ms"] }
+                    "id": 2,
+                    "params": {
+                        "currency": "BTC",
+                        "kind": "option",
+                        "expired": false
+                    }
                 }));
             };
 
             ws.onmessage = (event) => {
-                const response = JSON.parse(event.data);
-                
-                // Handle response for the initial get_instruments request
-                if (response.id === 101 && response.result) {
-                    processInstruments(response.result);
-                }
-                
-                // Handle real-time ticker data subscriptions
-                if (response.method === 'subscription' && response.params.channel.startsWith('ticker')) {
-                    const data = response.params.data;
-                    instrumentData[data.instrument_name] = data;
-                    // Update BTC-USD price from BTC-PERPETUAL ticker's index_price
-                    if (data.instrument_name === 'BTC-PERPETUAL' && data.index_price !== undefined) {
-                        btcUsdPrice = data.index_price;
-                    }
-                }
-
-                // Handle heartbeat responses to keep the connection alive
-                if (response.method === 'heartbeat') {
-                    // Respond to heartbeat to acknowledge and keep session alive
-                    ws.send(JSON.stringify({"jsonrpc": "2.0", "method": "public/test", "id": 999}));
+                const data = JSON.parse(event.data);
+                // Always update the "Last Updated" timestamp when any ticker data is received
+                if (data.params && data.params.channel.startsWith('ticker.')) {
+                    handleTickerUpdate(data.params.data);
+                    lastUpdatedEl.textContent = `อัปเดตล่าสุด: ${new Date().toLocaleTimeString()}`; // Update timestamp here
+                } else if (data.id === 1 && data.result) {
+                    btcUsdPrice = data.result.index_price;
+                    addLog(`ราคา BTC-USD อัปเดต: ${btcUsdPrice.toFixed(2)} USD`, 'info');
+                } else if (data.id === 2 && data.result) {
+                    processInstruments(data.result);
+                } else if (data.method === 'subscription') {
+                    // This is where real-time ticker data comes in after subscription
+                    handleTickerUpdate(data.params.data);
+                    lastUpdatedEl.textContent = `อัปเดตล่าสุด: ${new Date().toLocaleTimeString()}`; // Update timestamp for subscription messages too
+                } else {
+                    // console.log("Received:", data); // Log other messages for debugging
                 }
             };
 
-            ws.onclose = (event) => {
-                connStatus.classList.remove('animate-pulse');
-                connStatus.classList.replace('bg-green-500', 'bg-red-500');
-                connStatus.classList.replace('bg-yellow-500', 'bg-red-500');
-                connText.textContent = 'การเชื่อมต่อถูกตัด';
-                connText.classList.replace('text-green-400', 'text-red-400');
-                connText.classList.replace('text-yellow-400', 'text-red-400');
-                addLog(`การเชื่อมต่อกับ Deribit ถูกตัด: โค้ด ${event.code}, เหตุผล: ${event.reason || 'ไม่ทราบ'}`, 'warn');
-                instrumentScanComplete = false; // Reset flag so it rescans instruments on reconnect
-                setTimeout(connectWebSocket, RECONNECT_INTERVAL); // Attempt to reconnect after a delay
+            ws.onclose = () => {
+                connStatus.classList.remove('bg-green-500', 'bg-yellow-500');
+                connStatus.classList.add('bg-red-500');
+                connStatus.classList.add('animate-pulse'); // Start pulsing on disconnection
+                connText.textContent = 'การเชื่อมต่อกับ Deribit ถูกตัด';
+                connText.classList.remove('text-green-400', 'text-yellow-400');
+                connText.classList.add('text-red-400');
+                addLog('WebSocket การเชื่อมต่อกับ Deribit ถูกตัด. กำลังพยายามเชื่อมต่อใหม่...', 'warn');
+                setTimeout(connectWebSocket, RECONNECT_INTERVAL); // Attempt to reconnect
             };
 
             ws.onerror = (error) => {
-                connStatus.classList.remove('animate-pulse');
-                connStatus.classList.replace('bg-green-500', 'bg-red-500');
-                connStatus.classList.replace('bg-yellow-500', 'bg-red-500');
-                connText.textContent = 'เกิดข้อผิดพลาดในการเชื่อมต่อ';
-                connText.classList.replace('text-green-400', 'text-red-400');
-                connText.classList.replace('text-yellow-400', 'text-red-400');
-                addLog(`เกิดข้อผิดพลาด WebSocket: ${error.message || 'ไม่ทราบสาเหตุ'}`, 'warn');
-                ws.close(); // Close the problematic connection to trigger onclose and retry
+                addLog(`WebSocket ข้อผิดพลาด: ${error.message || 'ไม่ทราบข้อผิดพลาด'}`, 'warn');
+                console.error("WebSocket Error:", error);
             };
         }
 
-        // --- LLM (Gemini API) Integration ---
         /**
-         * Calls the Gemini API to generate text based on a given prompt.
-         * Displays a loading spinner and then the response in a modal.
-         * @param {string} title - Title for the modal.
-         * @param {string} prompt - The prompt to send to the LLM.
+         * Handles incoming ticker updates from Deribit.
+         * Updates the `instrumentData` map and triggers arbitrage calculation.
+         * @param {Object} tickerData - The ticker data object.
          */
-        async function callGeminiAPI(title, prompt) {
+        function handleTickerUpdate(tickerData) {
+            const instrumentName = tickerData.instrument_name;
+            // Only update instrumentData and trigger calculations if bid_price and ask_price are present
+            if (tickerData.bid_price !== undefined && tickerData.ask_price !== undefined) {
+                instrumentData[instrumentName] = { 
+                    mark_price: tickerData.mark_price, // Still keep mark_price for reference if needed
+                    bid_price: tickerData.bid_price,
+                    ask_price: tickerData.ask_price
+                };
+                // Trigger calculation and rendering only after initial scan is complete
+                if (instrumentScanComplete) {
+                    updateAndRenderOpportunities();
+                }
+            }
+            // For BTC-PERPETUAL (used to get btcUsdPrice)
+            if (instrumentName === 'BTC-PERPETUAL' && tickerData.index_price !== undefined) {
+                btcUsdPrice = tickerData.index_price;
+            }
+        }
+
+
+        // --- LLM MODAL FUNCTIONS ---
+        /**
+         * Displays the LLM modal with a title and content.
+         * @param {string} title - The title for the modal.
+         * @param {string} contentHtml - The HTML content to display in the modal body.
+         */
+        function showLlmModal(title, contentHtml = `<div class="flex items-center justify-center p-4"><div class="loading-spinner"></div><span class="ml-3 text-lg">กำลังสร้างคำตอบ...</span></div>`) {
             modalTitle.textContent = title;
-            modalBody.innerHTML = `
-                <div class="flex items-center justify-center p-4">
-                    <div class="loading-spinner"></div>
-                    <span class="ml-3 text-lg">กำลังสร้างคำตอบ...</span>
-                </div>
-            `;
+            modalBody.innerHTML = contentHtml;
             llmModal.classList.add('show');
+        }
+
+        /**
+         * Hides the LLM modal.
+         */
+        function hideLlmModal() {
+            llmModal.classList.remove('show');
+        }
+
+        modalCloseBtn.addEventListener('click', hideLlmModal);
+
+        // Fetch data from LLM
+        async function fetchLlmResponse(prompt) {
+            // Placeholder for API key, Canvas will provide it at runtime for default models
+            const apiKey = ""; 
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+
+            const payload = { contents: chatHistory };
 
             try {
-                let chatHistory = [];
-                chatHistory.push({ role: "user", parts: [{ text: prompt }] });
-                const payload = { contents: chatHistory };
-                const apiKey = ""; // Canvas will automatically provide the API key
-                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-
                 const response = await fetch(apiUrl, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
-
                 const result = await response.json();
 
                 if (result.candidates && result.candidates.length > 0 &&
                     result.candidates[0].content && result.candidates[0].content.parts &&
                     result.candidates[0].content.parts.length > 0) {
-                    const text = result.candidates[0].content.parts[0].text;
-                    modalBody.innerHTML = `<p class="whitespace-pre-wrap">${text}</p>`; // Use pre-wrap to preserve formatting
-                    addLog(`ได้รับคำตอบจาก Gemini API สำหรับ: "${title}"`, 'success');
+                    return result.candidates[0].content.parts[0].text;
                 } else {
-                    modalBody.innerHTML = `<p class="text-red-400">ไม่สามารถสร้างคำตอบได้. โปรดลองอีกครั้ง.</p>`;
-                    addLog(`ข้อผิดพลาด: ไม่สามารถรับคำตอบที่ถูกต้องจาก Gemini API สำหรับ: "${title}"`, 'warn');
-                    console.error("Gemini API response structure unexpected:", result);
+                    console.error("LLM response structure unexpected:", result);
+                    return "ไม่สามารถสร้างคำตอบได้ กรุณาลองใหม่ในภายหลัง.";
                 }
             } catch (error) {
-                modalBody.innerHTML = `<p class="text-red-400">เกิดข้อผิดพลาดในการเรียกใช้ Gemini API: ${error.message}</p>`;
-                addLog(`ข้อผิดพลาดในการเรียกใช้ Gemini API สำหรับ: "${title}" - ${error.message}`, 'warn');
-                console.error("Error calling Gemini API:", error);
+                console.error("Error fetching from LLM API:", error);
+                return "เกิดข้อผิดพลาดในการเชื่อมต่อกับ LLM.";
             }
         }
 
-        // Event listener for "Explain Arbitrage" button
-        explainArbitrageBtn.addEventListener('click', () => {
-            let prompt = "";
-            let title = "";
-            if (currentArbitrageType === 'box') {
-                title = "คำอธิบาย Box Spread Arbitrage";
-                prompt = "อธิบาย Box Spread arbitrage ในตลาด crypto options โดยใช้ภาษาที่เข้าใจง่ายและเป็นภาษาไทย";
-            } else {
-                title = "คำอธิบาย Calendar Spread Arbitrage";
-                prompt = "อธิบาย Calendar Spread arbitrage ในตลาด crypto options โดยใช้ภาษาที่เข้าใจง่ายและเป็นภาษาไทย";
+        // LLM Explain Arbitrage Strategy button listener
+        explainArbitrageBtn.addEventListener('click', async () => {
+            showLlmModal('อธิบายกลยุทธ์ Arbitrage');
+            let prompt = "อธิบายกลยุทธ์ Box Spread และ Calendar Spread ในตลาด Options สำหรับนักลงทุนรายย่อย. ให้รายละเอียดเกี่ยวกับวิธีการสร้าง spread, ผลตอบแทนที่คาดหวัง, และความเสี่ยงที่เกี่ยวข้อง อธิบายโดยใช้ภาษาไทยที่เข้าใจง่าย";
+            
+            // Add current arbitrage opportunities to the prompt if available, for context
+            if (currentArbitrageType === 'box' && calculatedBoxSpreadsData.length > 0) {
+                const topBox = calculatedBoxSpreadsData[0];
+                prompt += `\n\nปัจจุบันมีโอกาส Box Spread ที่น่าสนใจที่สุด:
+                - Expiry: ${topBox.expiry}
+                - Strike Range: ${topBox.k1}-${topBox.k2}
+                - Net Premium: $${topBox.netPremium.toFixed(2)} (คำนวณจากราคา Bid/Ask)
+                - Theoretical Value: $${topBox.theoreticalValue.toFixed(2)}
+                - Arbitrage Profit: $${topBox.arbitrageProfit.toFixed(2)}
+                โปรดอธิบาย spread นี้โดยเฉพาะ และเน้นว่าราคาที่ใช้เป็นราคา Bid/Ask ที่สามารถเทรดได้จริง`;
+            } else if (currentArbitrageType === 'calendar' && calculatedCalendarSpreadsData.length > 0) {
+                const topCal = calculatedCalendarSpreadsData[0];
+                prompt += `\n\nปัจจุบันมีโอกาส Calendar Spread ที่น่าสนใจที่สุด:
+                - Type: ${topCal.type}
+                - Strike: ${topCal.strike}
+                - Shorter Expiry: ${topCal.shorterExpiry}
+                - Longer Expiry: ${topCal.longerExpiry}
+                - Premium Difference: $${topCal.premiumDiff.toFixed(2)} (คำนวณจากราคา Bid/Ask)
+                - Arbitrage Profit: $${topCal.arbitrageProfit.toFixed(2)}
+                โปรดอธิบาย spread นี้โดยเฉพาะ และเน้นว่าราคาที่ใช้เป็นราคา Bid/Ask ที่สามารถเทรดได้จริง`;
             }
-            callGeminiAPI(title, prompt);
+
+            const response = await fetchLlmResponse(prompt);
+            modalBody.innerHTML = `<p class="whitespace-pre-wrap">${response}</p>`; // Use pre-wrap for preserving formatting
         });
 
-        // Event listener for "Risk Assessment" button
-        riskAssessmentBtn.addEventListener('click', () => {
-            let prompt = "";
-            let title = "";
-            let opportunitiesData = (currentArbitrageType === 'box' ? calculatedBoxSpreadsData : calculatedCalendarSpreadsData);
+        // LLM Risk Assessment button listener
+        riskAssessmentBtn.addEventListener('click', async () => {
+            showLlmModal('ประเมินความเสี่ยง');
+            let prompt = "ประเมินความเสี่ยงที่เกี่ยวข้องกับการทำ Arbitrage Options (โดยเฉพาะ Box Spread และ Calendar Spread) ในตลาด Crypto. ให้พิจารณาถึงความเสี่ยงจาก Liquidity, slippage, counterparty risk, และ regulatory changes.";
 
-            if (opportunitiesData.length === 0 || opportunitiesData[0].profit <= 0) {
-                title = `การประเมินความเสี่ยงทั่วไปสำหรับ ${currentArbitrageType === 'box' ? 'Box Spread' : 'Calendar Spread'}`;
-                prompt = `โปรดอธิบายความเสี่ยงทั่วไปที่อาจเกิดขึ้นกับกลยุทธ์ ${currentArbitrageType === 'box' ? 'Box Spread' : 'Calendar Spread'} arbitrage ในตลาด crypto options โดยละเอียดและเป็นภาษาไทย`;
-                addLog(`ไม่มีโอกาส Arbitrage ที่มีกำไรในปัจจุบันสำหรับ ${currentArbitrageType === 'box' ? 'Box Spread' : 'Calendar Spread'}, ให้คำแนะนำความเสี่ยงทั่วไปแทน.`, 'info');
-            } else {
-                const topOpportunity = opportunitiesData[0]; // Get the top profitable opportunity
-                if (currentArbitrageType === 'box') {
-                    title = `การประเมินความเสี่ยงสำหรับ Box Spread: ${topOpportunity.expiry} ${topOpportunity.k1}/${topOpportunity.k2}`;
-                    prompt = `สำหรับ Box Spread arbitrage ใน crypto options ที่มีวันหมดอายุ ${topOpportunity.expiry}, Strike K1 ที่ ${topOpportunity.k1} และ Strike K2 ที่ ${topOpportunity.k2} และมีกำไรสุทธิ ${topOpportunity.profit.toFixed(2)} USD โปรดอธิบายความเสี่ยงที่อาจเกิดขึ้นกับกลยุทธ์นี้โดยละเอียดและเป็นภาษาไทย`;
-                } else {
-                    title = `การประเมินความเสี่ยงสำหรับ Calendar Spread: ${topOpportunity.strike} ${topOpportunity.type}, วันหมดอายุระยะสั้น ${topOpportunity.shorterExpiry} และระยะยาว ${topOpportunity.longerExpiry} และมีกำไรสุทธิ ${topOpportunity.profit.toFixed(2)} USD โปรดอธิบายความเสี่ยงที่อาจเกิดขึ้นกับกลยุทธ์นี้โดยละเอียดและเป็นภาษาไทย`;
-                }
+            // Add current arbitrage opportunities to the prompt for context
+            if (currentArbitrageType === 'box' && calculatedBoxSpreadsData.length > 0) {
+                const topBox = calculatedBoxSpreadsData[0];
+                prompt += `\n\nพิจารณาความเสี่ยงที่เกี่ยวข้องกับ Box Spread นี้:
+                - Expiry: ${topBox.expiry}
+                - Strike Range: ${topBox.k1}-${topBox.k2}
+                - Net Premium: $${topBox.netPremium.toFixed(2)} (คำนวณจากราคา Bid/Ask)
+                - Theoretical Value: $${topBox.theoreticalValue.toFixed(2)}
+                - Arbitrage Profit: $${topBox.arbitrageProfit.toFixed(2)}
+                และอธิบายว่าข้อมูลเหล่านี้เกี่ยวข้องกับความเสี่ยงอย่างไร รวมถึงความเสี่ยงจาก Bid/Ask Spread ที่กว้างในตลาด Options`;
+            } else if (currentArbitrageType === 'calendar' && calculatedCalendarSpreadsData.length > 0) {
+                const topCal = calculatedCalendarSpreadsData[0];
+                prompt += `\n\nพิจารณาความเสี่ยงที่เกี่ยวข้องกับ Calendar Spread นี้:
+                - Type: ${topCal.type}
+                - Strike: ${topCal.strike}
+                - Shorter Expiry: ${topCal.shorterExpiry}
+                - Longer Expiry: ${topCal.longerExpiry}
+                - Premium Difference: $${topCal.premiumDiff.toFixed(2)} (คำนวณจากราคา Bid/Ask)
+                - Arbitrage Profit: $${topCal.arbitrageProfit.toFixed(2)}
+                และอธิบายว่าข้อมูลเหล่านี้เกี่ยวข้องกับความเสี่ยงอย่างไร รวมถึงความเสี่ยงจาก Bid/Ask Spread ที่กว้างในตลาด Options`;
             }
-            callGeminiAPI(title, prompt);
+
+            const response = await fetchLlmResponse(prompt);
+            modalBody.innerHTML = `<p class="whitespace-pre-wrap">${response}</p>`; // Use pre-wrap for preserving formatting
         });
 
-        // Close modal functionality
-        modalCloseBtn.addEventListener('click', () => {
-            llmModal.classList.remove('show');
-            modalBody.innerHTML = ''; // Clear content when closing
-        });
-
-        // Close modal when clicking outside of the content
-        llmModal.addEventListener('click', (e) => {
-            if (e.target === llmModal) {
-                llmModal.classList.remove('show');
-                modalBody.innerHTML = '';
-            }
-        });
 
         // --- INITIALIZATION ---
-        loadSettings(); // Load all settings (threshold and fee) from local storage on startup
-        connectWebSocket(); // Initiate WebSocket connection
-        // Set an interval to re-calculate and re-render the top list periodically
-        setInterval(updateAndRenderOpportunities, 1000); // Update table and check alerts every second
+        loadSettings(); // Load settings from local storage
+        connectWebSocket(); // Establish WebSocket connection on page load
     });
     </script>
 </body>
